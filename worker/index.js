@@ -99,7 +99,7 @@ const MAX_PLAYERS = 30;
 const SKINS_COUNT = 43;
 
 // =====================================================
-// 顶部新增配置项（请确保放在 GameRoom 类定义的上方）
+// 顶部新增配置项
 // =====================================================
 const POWERUP_COUNT = 250;        // 地图上维持的道具（护盾/磁铁）总数
 const POWERUP_DURATION = 12;     // 每吃一个道具增加的持续时间（秒）
@@ -280,17 +280,22 @@ export class GameRoom {
     return { x: pos.x, y: pos.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, radius: 22 + Math.random() * 8, value: 50 + Math.floor(Math.random() * 31), color: Math.floor(Math.random() * 8), spin: Math.random() * Math.PI * 2 };
   }
 
-  // 新增：生成全图功能道具（护盾/磁铁）
+  // 修改：生成全图浮动功能道具（护盾/磁铁），注入类似于光球的移动速度 vx, vy
   _spawnPowerups() { while (this.powerups.length < POWERUP_COUNT) this.powerups.push(this._createPowerup()); }
   _createPowerup() {
     const pos = this._zoned(1.4);
     const type = Math.random() < 0.5 ? 'shield' : 'magnet';
+    const a = Math.random() * Math.PI * 2;
+    const speed = 20 + Math.random() * 20; // 道具浮动速度（略慢于大光球，更易拾取）
     return {
       x: pos.x,
       y: pos.y,
+      vx: Math.cos(a) * speed,
+      vy: Math.sin(a) * speed,
       type: type,
       radius: 18,
-      color: type === 'shield' ? 8 : 9 // 8号颜色代指护盾，9号代指磁铁，供前端区分
+      color: type === 'shield' ? 8 : 9, // 8号颜色代指护盾，9号代指磁铁，供前端区分
+      spin: Math.random() * Math.PI * 2 // 预留自传弧度
     };
   }
 
@@ -399,10 +404,21 @@ export class GameRoom {
     this.lastTick = now;
     this.tickCount++;
 
-    // 移动超级能量球
+    // 1. 移动超级能量球
     const half = MAP_SIZE / 2 - 50;
     for (const m of this.megaOrbs) { m.x += m.vx * dt; m.y += m.vy * dt; m.spin += dt * 1.5; if (m.x < -half) { m.x = -half; m.vx = Math.abs(m.vx); } if (m.x > half) { m.x = half; m.vx = -Math.abs(m.vx); } if (m.y < -half) { m.y = -half; m.vy = Math.abs(m.vy); } if (m.y > half) { m.y = half; m.vy = -Math.abs(m.vy); } }
     
+    // 修改新增：让地上的功能道具（护盾/磁铁）也动起来并在边缘反弹
+    for (const p of this.powerups) { 
+      p.x += p.vx * dt; 
+      p.y += p.vy * dt; 
+      if (p.spin !== undefined) p.spin += dt * 1.5; 
+      if (p.x < -half) { p.x = -half; p.vx = Math.abs(p.vx); } 
+      if (p.x > half) { p.x = half; p.vx = -Math.abs(p.vx); } 
+      if (p.y < -half) { p.y = -half; p.vy = Math.abs(p.vy); } 
+      if (p.y > half) { p.y = half; p.vy = -Math.abs(p.vy); } 
+    }
+
     // Bot 决策
     for (const [, s] of this.snakes) { if (s.isBot && s.alive) this._botAI(s, dt); }
     
@@ -577,7 +593,7 @@ export class GameRoom {
     else { s.botWanderAngle += (Math.random() - 0.5) * 1.5; s.targetAngle = s.botWanderAngle; s.boosting = false; }
   }
 
-  // --- Broadcasting 状态同步 (核心重构：Bitmask下发) ---
+  // --- Broadcasting 状态同步 ---
   _broadcastState() {
     for (const [ws, playerId] of this.clients) {
       const mySnake = this.snakes.get(playerId);
@@ -597,7 +613,7 @@ export class GameRoom {
       let totalSegs = 0, totalNameBytes = 0;
       for (const s of visSnakes) { totalSegs += s.segments.length; totalNameBytes += new TextEncoder().encode(s.name).length; }
       
-      // 保持原有网络结构，尾部追加新增的 visPowerups 数据传输 [2字节数量 + 每个道具7字节(x,y,color,radius)]
+      // 保持原有网络结构，尾部追加新增的 visPowerups 数据传输 [2字节数量 + 每个道具6字节(x,y,color,radius)]
       const bufSize = 1 + 2 + visSnakes.length * (2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 2) + totalNameBytes + totalSegs * 4 + 2 + visFood.length * 7 + 2 + visMega.length * 7 + 2 + visPowerups.length * 6;
       const buf = new ArrayBuffer(bufSize);
       const u8 = new Uint8Array(buf);
@@ -611,10 +627,6 @@ export class GameRoom {
         u8[off++] = snake.skin; u8[off++] = snake.boosting ? 1 : 0; u8[off++] = snake.isBot ? 1 : 0;
         dv.setInt8(off, snake.teamId); off += 1;
         
-        // =====================================================
-        // 核心修改：将单字节的无敌改造成状态按位掩码(Bitmask)
-        // 1=仅有护盾/无敌, 2=仅有磁铁, 3=全都有, 0=无状态。无缝平滑兼容原结构
-        // =====================================================
         let statusMask = 0;
         if (snake.invincible > 0) statusMask |= 1;
         if (snake.magnetTime > 0) statusMask |= 2;
