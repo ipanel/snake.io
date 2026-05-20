@@ -80,13 +80,9 @@ export default {
 // GameRoom Durable Object — one per room
 // =====================================================
 
-// =====================================================
-// GameRoom Durable Object — one per room
-// =====================================================
-
 const MAP_SIZE = 14000;
-const FOOD_COUNT = 5200;
-const MAX_FOOD = 12000;
+const FOOD_COUNT = 1200;
+const MAX_FOOD = 2000;
 const SNAKE_SPEED = 280;
 const BOOST_SPEED = 500;
 const SEGMENT_SPACING = 24;
@@ -95,19 +91,12 @@ const INITIAL_LENGTH = 10;
 const HEAD_RADIUS = 14;
 const BOOST_SHRINK_RATE = 2.5;
 const MAX_BOTS = 15;
-const MEGA_ORB_COUNT = 1200;
+const MEGA_ORB_COUNT = 120;
 const TICK_RATE = 30;
 const TICK_MS = 1000 / TICK_RATE;
 const BROADCAST_MS = 33;
 const MAX_PLAYERS = 30;
 const SKINS_COUNT = 43;
-
-// ==================== 【新增：磁铁属性相关常量】 ====================
-const MAGNET_RANGE = 400;       // 磁铁吸附半径（单位：游戏坐标距离）
-const MAGNET_SPEED = 650;       // 食物被吸向大光球的速度
-const MAGNET_INIT_TIME = 15;    // 大光球初始磁铁持续时间（秒）
-const MAGNET_ADD_TIME = 0.5;    // 每吞噬一个食物，磁铁时间叠加增加量（秒）
-// ===================================================================
 
 const BOT_NAMES = [
   'Viper','Shadow','Blaze','Neon','Ghost','Toxic','Pixel','Glitch',
@@ -282,21 +271,9 @@ export class GameRoom {
   }
 
   _spawnMegaOrbs() { while (this.megaOrbs.length < MEGA_ORB_COUNT) this.megaOrbs.push(this._createMegaOrb()); }
-  
-  // 修改：让新生成的大光球拥有初始 15 秒的磁铁时间属性
   _createMegaOrb() {
     const a = Math.random() * Math.PI * 2, speed = 25 + Math.random() * 25, pos = this._zoned(1.3);
-    return { 
-      x: pos.x, 
-      y: pos.y, 
-      vx: Math.cos(a) * speed, 
-      vy: Math.sin(a) * speed, 
-      radius: 22 + Math.random() * 8, 
-      value: 50 + Math.floor(Math.random() * 31), 
-      color: Math.floor(Math.random() * 8), 
-      spin: Math.random() * Math.PI * 2,
-      magnetTimer: MAGNET_INIT_TIME // 新增：初始赋予 15 秒磁铁属性
-    };
+    return { x: pos.x, y: pos.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, radius: 22 + Math.random() * 8, value: 50 + Math.floor(Math.random() * 31), color: Math.floor(Math.random() * 8), spin: Math.random() * Math.PI * 2 };
   }
 
   // --- Bots ---
@@ -342,7 +319,7 @@ export class GameRoom {
     }
     while (this.bots.length < target) {
       const snake = this._createSnake(BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)], true, Math.floor(Math.random() * SKINS_COUNT), Math.random() < 0.05 ? 2 : Math.random() < 0.3 ? 1 : 0);
-      if (this.mode === 'team') { let minT = 0, minS = Infinity; for (const [id, t] of this.teams) { if (t.memberIds.size < minS) { minS = t.memberIds.size; mt = id; } } snake.teamId = minT; this.teams.get(minT).memberIds.add(snake.id); }
+      if (this.mode === 'team') { let minT = 0, minS = Infinity; for (const [id, t] of this.teams) { if (t.memberIds.size < minS) { minS = t.memberIds.size; minT = id; } } snake.teamId = minT; this.teams.get(minT).memberIds.add(snake.id); }
       this.bots.push(snake.id);
     }
   }
@@ -381,29 +358,13 @@ export class GameRoom {
     const dt = Math.min((now - this.lastTick) / 1000, 0.05);
     this.lastTick = now;
     this.tickCount++;
-
-    // 1. Mega orbs 移动和时间扣减
+    // Mega orbs
     const half = MAP_SIZE / 2 - 50;
-    for (const m of this.megaOrbs) { 
-      m.x += m.vx * dt; 
-      m.y += m.vy * dt; 
-      m.spin += dt * 1.5; 
-      
-      // 新增：磁铁持续时间随时间流逝而减少
-      if (m.magnetTimer > 0) {
-        m.magnetTimer = Math.max(0, m.magnetTimer - dt);
-      }
-
-      if (m.x < -half) { m.x = -half; m.vx = Math.abs(m.vx); } 
-      if (m.x > half) { m.x = half; m.vx = -Math.abs(m.vx); } 
-      if (m.y < -half) { m.y = -half; m.vy = Math.abs(m.vy); } 
-      if (m.y > half) { m.y = half; m.vy = -Math.abs(m.vy); } 
-    }
-
-    // 2. Bot AI
+    for (const m of this.megaOrbs) { m.x += m.vx * dt; m.y += m.vy * dt; m.spin += dt * 1.5; if (m.x < -half) { m.x = -half; m.vx = Math.abs(m.vx); } if (m.x > half) { m.x = half; m.vx = -Math.abs(m.vx); } if (m.y < -half) { m.y = -half; m.vy = Math.abs(m.vy); } if (m.y > half) { m.y = half; m.vy = -Math.abs(m.vy); } }
+    // Bot AI
     for (const [, s] of this.snakes) { if (s.isBot && s.alive) this._botAI(s, dt); }
-
-    // 3. 构建食物空间网格索引
+    // Update snakes
+    // Build food grid
     const foodGrid = new Map();
     for (let i = 0; i < this.food.length; i++) {
       const f = this.food[i];
@@ -411,77 +372,9 @@ export class GameRoom {
       if (!foodGrid.has(key)) foodGrid.set(key, []);
       foodGrid.get(key).push(i);
     }
-
-    // ==================== 【修改：磁铁吸附与时间叠加逻辑】 ====================
-    const foodEatenByOrbs = new Set();
-
-    for (const m of this.megaOrbs) {
-      // 只有当磁铁倒计时大于 0 时，才执行磁铁吸附效果
-      if (m.magnetTimer <= 0) continue;
-
-      const cx = Math.floor(m.x / 500);
-      const cy = Math.floor(m.y / 500);
-
-      for (let gx = cx - 1; gx <= cx + 1; gx++) {
-        for (let gy = cy - 1; gy <= cy + 1; gy++) {
-          const cell = foodGrid.get(gx + ',' + gy);
-          if (!cell) continue;
-
-          for (const fi of cell) {
-            if (foodEatenByOrbs.has(fi)) continue;
-            const f = this.food[fi];
-            if (!f) continue;
-
-            const dx = m.x - f.x;
-            const dy = m.y - f.y;
-            const distSq = dx * dx + dy * dy;
-
-            if (distSq < MAGNET_RANGE * MAGNET_RANGE) {
-              const dist = Math.sqrt(distSq);
-              
-              // 判定 1：彻底吸入大光球中心并吞噬
-              if (dist < m.radius + f.radius) {
-                foodEatenByOrbs.add(fi);
-                m.value += f.value || 1; // 增加大光球分数
-                
-                // 核心改动：吃掉食物后，叠加增加磁铁剩余时间
-                m.magnetTimer += MAGNET_ADD_TIME; 
-                continue;
-              }
-
-              // 判定 2：在磁铁范围内，产生平滑的拉力牵引效果
-              const force = (1 - dist / MAGNET_RANGE) * MAGNET_SPEED;
-              f.x += (dx / dist) * force * dt;
-              f.y += (dy / dist) * force * dt;
-            }
-          }
-        }
-      }
-    }
-
-    // 集中处理由于被大光球吃掉而需移除的食物
-    if (foodEatenByOrbs.size > 0) {
-      const toRemoveArr = Array.from(foodEatenByOrbs).sort((a, b) => b - a);
-      for (const idx of toRemoveArr) {
-        this.food.splice(idx, 1);
-      }
-      
-      // 食物列表变更，重新为接下来的蛇更新空间索引
-      foodGrid.clear();
-      for (let i = 0; i < this.food.length; i++) {
-        const f = this.food[i];
-        const key = Math.floor(f.x / 500) + ',' + Math.floor(f.y / 500);
-        if (!foodGrid.has(key)) foodGrid.set(key, []);
-        foodGrid.get(key).push(i);
-      }
-    }
-    // ===================================================================
-
-    // 4. 更新蛇运动与进食
     for (const [, s] of this.snakes) { if (s.alive) this._updateSnake(s, dt, foodGrid); }
     this._checkCollisions();
-    this._spawnFood(); 
-    this._spawnMegaOrbs();
+    this._spawnFood(); this._spawnMegaOrbs();
     while (this.food.length > MAX_FOOD) this.food.shift();
   }
 
