@@ -60,7 +60,6 @@ export default {
     // Room code lookup
     if (url.pathname.startsWith('/api/rooms/code/')) {
       const code = url.pathname.split('/').pop().toUpperCase();
-      // We'd need a KV store for code→room mapping. For now return not found.
       return new Response(JSON.stringify({ error: 'Not implemented' }), { status: 404, headers: corsHeaders });
     }
 
@@ -81,9 +80,9 @@ export default {
 // =====================================================
 
 const MAP_SIZE = 14000;
-// 修改点 1：大幅提升光球的基础数量与上限数量
-const FOOD_COUNT = 3000; // 基础光球数量从 1200 提升至 3000
-const MAX_FOOD = 5000;   // 最大光球上限从 2000 提升至 5000
+// 修改点 1：提升普通光球和【浮动光球】的数量，让地图更丰富
+const FOOD_COUNT = 2500; // 普通光球增加多一点
+const MAX_FOOD = 4000;   
 const SNAKE_SPEED = 280;
 const BOOST_SPEED = 500;
 const SEGMENT_SPACING = 24;
@@ -92,7 +91,7 @@ const INITIAL_LENGTH = 10;
 const HEAD_RADIUS = 14;
 const BOOST_SHRINK_RATE = 2.5;
 const MAX_BOTS = 15;
-const MEGA_ORB_COUNT = 25; // 顺便把大光球数量也从 12 提升到 25 增加刺激感
+const MEGA_ORB_COUNT = 145; // 浮动大光球从 12 个大幅增加到 45 个！
 const TICK_RATE = 30;
 const TICK_MS = 1000 / TICK_RATE;
 const BROADCAST_MS = 33;
@@ -284,14 +283,15 @@ export class GameRoom {
     const pos = isBot ? this._zoned(1.2) : this._zoned(2.5);
     const segments = [];
     for (let i = 0; i < INITIAL_LENGTH; i++) segments.push({ x: pos.x - Math.cos(angle) * i * SEGMENT_SPACING, y: pos.y - Math.sin(angle) * i * SEGMENT_SPACING });
-    // 修改点 2：在生成蛇时，初始化 magnetTimer（磁铁倒计时）和原本的 invincible 属性（此处改为支持累加时间）
+    
+    // 修改点 2：在蛇身上初始化 磁铁计时器 (magnetTimer)
     const snake = { 
       id, name, segments, angle, targetAngle: angle, 
       boosting: false, score: 0, skin: skinIdx, accessory: accessory || 0, 
       color: Math.floor(Math.random() * 8), alive: true, isBot, skill: skill || 0, 
       boostAccum: 0, botTimer: 0, botWanderAngle: angle, teamId: -1, 
-      invincible: 2, // 初始自带 2 秒无敌保护
-      magnetTimer: 0, // 初始磁铁时间 0 秒
+      invincible: 2,  // 固有无敌时间字段（我们将用它来叠加无限无敌）
+      magnetTimer: 0, // 固有磁铁倒计时
       kills: 0 
     };
     this.snakes.set(id, snake);
@@ -362,17 +362,24 @@ export class GameRoom {
     for (const m of this.megaOrbs) { m.x += m.vx * dt; m.y += m.vy * dt; m.spin += dt * 1.5; if (m.x < -half) { m.x = -half; m.vx = Math.abs(m.vx); } if (m.x > half) { m.x = half; m.vx = -Math.abs(m.vx); } if (m.y < -half) { m.y = -half; m.vy = Math.abs(m.vy); } if (m.y > half) { m.y = half; m.vy = -Math.abs(m.vy); } }
     for (const [, s] of this.snakes) { if (s.isBot && s.alive) this._botAI(s, dt); }
 
-    // 修改点 3：由于磁铁会改变光球的（x, y）坐标，我们先执行 _updateSnake 更新磁铁拉扯，再重新构建网格或直接判定
-    // 为了简单且高性能，我们在 _updateSnake 内部处理磁铁对全局 food 的位置拉扯
-    for (const [, s] of this.snakes) { if (s.alive) this._updateSnake(s, dt); }
+    // 建立普通食物的网格（优化原有静态光球碰撞性能）
+    const foodGrid = new Map();
+    for (let i = 0; i < this.food.length; i++) {
+      const f = this.food[i];
+      const key = Math.floor(f.x / 500) + ',' + Math.floor(f.y / 500);
+      if (!foodGrid.has(key)) foodGrid.set(key, []);
+      foodGrid.get(key).push(i);
+    }
+
+    for (const [, s] of this.snakes) { if (s.alive) this._updateSnake(s, dt, foodGrid); }
 
     this._checkCollisions();
     this._spawnFood(); this._spawnMegaOrbs();
     while (this.food.length > MAX_FOOD) this.food.shift();
   }
 
-  _updateSnake(snake, dt) {
-    // 衰减无敌和磁铁时间
+  _updateSnake(snake, dt, foodGrid) {
+    // 衰减倒计时状态
     if (snake.invincible > 0) snake.invincible = Math.max(0, snake.invincible - dt);
     if (snake.magnetTimer > 0) snake.magnetTimer = Math.max(0, snake.magnetTimer - dt);
 
@@ -410,69 +417,56 @@ export class GameRoom {
       }
     }
 
-    // 计算吞噬半径
     const headR = HEAD_RADIUS * this._thickness(snake);
     
-    // 修改点 4：根据是否有磁铁功能，动态调整“磁铁吸附范围”
-    // 如果有磁铁道具状态，吸附半径扩大到 450 像素（可根据需要微调）
-    const magnetRange = snake.magnetTimer > 0 ? 450 : 0; 
+    // 【普通静态光球逻辑】：原封不动，不触发任何磁铁吸附和无敌加成
     const eatR = headR + 30;
-
-    // 为了兼容磁铁的实时拉扯，我们遍历食物列表进行距离判定和磁力位移
-    for (let i = this.food.length - 1; i >= 0; i--) {
-      const f = this.food[i];
-      if (!f) continue;
-      const dx = f.x - head.x;
-      const dy = f.y - head.y;
-      const distSq = dx * dx + dy * dy;
-
-      // 1. 磁铁拉扯逻辑：如果在吸附范围内，光球向蛇头加速飞过去
-      if (magnetRange > 0 && distSq < magnetRange * magnetRange) {
-        const dist = Math.sqrt(distSq);
-        if (dist > 5) {
-          // 飞向蛇头的速度（离蛇头越近飞得越快）
-          const pullSpeed = 800 * (1 - dist / magnetRange) + speed; 
-          f.x -= (dx / dist) * pullSpeed * dt;
-          f.y -= (dy / dist) * pullSpeed * dt;
+    const cx = Math.floor(head.x / 500), cy = Math.floor(head.y / 500);
+    const toRemove = [];
+    for (let gx = cx - 1; gx <= cx + 1; gx++) {
+      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+        const cell = foodGrid.get(gx + ',' + gy);
+        if (!cell) continue;
+        for (const fi of cell) {
+          const f = this.food[fi];
+          if (!f) continue;
+          const dx = f.x - head.x, dy = f.y - head.y;
+          if (dx > eatR || dx < -eatR || dy > eatR || dy < -eatR) continue;
+          if (dx * dx + dy * dy < (headR + f.radius) ** 2) { toRemove.push(fi); snake.score += f.value || 1; }
         }
-      }
-
-      // 2. 正常吞噬逻辑判定（基于更新后的位置）
-      const newDx = f.x - head.x;
-      const newDy = f.y - head.y;
-      if (newDx * newDx + newDy * newDy < (headR + f.radius) ** 2) {
-        this.food.splice(i, 1);
-        snake.score += f.value || 1;
-
-        // 修改点 5：吃到任何光球，磁铁和无敌倒计时增加 15 秒（可累加）
-        snake.magnetTimer += 15;
-        snake.invincible += 15;
       }
     }
+    if (toRemove.length > 0) { toRemove.sort((a, b) => b - a); for (const i of toRemove) this.food.splice(i, 1); }
 
-    // 吞噬大光球（同样享受磁铁和无敌叠加效果）
+    // 修改点 3：【核心修改 - 浮动光球 (megaOrbs)】
+    // 当磁铁状态被激活时，磁铁只对浮动的 megaOrbs 产生拉扯拉近效果
+    const magnetRange = snake.magnetTimer > 0 ? 500 : 0; // 磁铁激活时，对浮动光球感应范围设定为 500 像素
+
     for (let i = this.megaOrbs.length - 1; i >= 0; i--) {
       const m = this.megaOrbs[i];
-      const dx = head.x - m.x;
-      const dy = head.y - m.y;
+      const dx = m.x - head.x;
+      const dy = m.y - head.y;
       const distSq = dx * dx + dy * dy;
 
+      // 如果有磁铁状态，且浮动大光球在吸附范围内：执行磁力拉扯效果
       if (magnetRange > 0 && distSq < magnetRange * magnetRange) {
         const dist = Math.sqrt(distSq);
         if (dist > 5) {
-          const pullSpeed = 600 * (1 - dist / magnetRange) + speed;
-          m.x += (dx / dist) * pullSpeed * dt;
-          m.y += (dy / dist) * pullSpeed * dt;
+          // 越靠近蛇头，拉扯吸过来的速度越快
+          const pullSpeed = 750 * (1 - dist / magnetRange) + speed;
+          m.x -= (dx / dist) * pullSpeed * dt;
+          m.y -= (dy / dist) * pullSpeed * dt;
         }
       }
 
-      const newDx = head.x - m.x;
-      const newDy = head.y - m.y;
+      // 重新计算实时距离判定吞噬
+      const newDx = m.x - head.x;
+      const newDy = m.y - head.y;
       if (newDx * newDx + newDy * newDy < (headR + m.radius) ** 2) {
         this.megaOrbs.splice(i, 1);
         snake.score += m.value;
         
-        // 吃到大光球同样累加 15 秒
+        // 修改点 4：只有吃到浮动大光球，才可以无限叠加 15 秒的磁铁和无敌倒计时
         snake.magnetTimer += 15;
         snake.invincible += 15;
       }
@@ -483,12 +477,12 @@ export class GameRoom {
     const arr = Array.from(this.snakes.values()).filter(s => s.alive);
     for (let i = 0; i < arr.length; i++) {
       const a = arr[i]; 
-      // 修改点 6：由于 invincible 现在会长时间累加，这里只要大于 0 就属于绝对无敌，不会触发死亡碰撞
+      // 修改点 5：只要累加的无敌时间大于 0，蛇就能直接免疫一切身体碰撞，绝对安全！
       if (!a.alive || a.invincible > 0) continue; 
       const ahead = a.segments[0], aHeadR = HEAD_RADIUS * this._thickness(a) * 0.75;
       for (let j = 0; j < arr.length; j++) {
         if (i === j) continue;
-        const b = arr[j]; if (!b.alive) continue; // 别人有没有无敌无所谓，只要“我”没有无敌，我撞上别人就会死
+        const b = arr[j]; if (!b.alive) continue; 
         if (this.mode === 'team' && a.teamId >= 0 && a.teamId === b.teamId) continue;
         const bDotR = DOT_RADIUS * this._thickness(b) * 0.75;
         const dist = aHeadR + bDotR, distSq = dist * dist;
@@ -507,7 +501,7 @@ export class GameRoom {
     const head = s.segments[0], wall = MAP_SIZE / 2 - 250;
     if (Math.abs(head.x) > wall || Math.abs(head.y) > wall) { s.targetAngle = Math.atan2(-head.y, -head.x); s.boosting = s.skill > 0; return; }
     
-    // 如果 Bot 处于无敌状态，它就不需要刻意避开别的蛇身体了，可以直接横冲直撞
+    // 如果电脑 Bot 吃到浮动光球获得了无敌，它也开启横冲直撞模式，不去特意避开障碍物
     if (s.invincible <= 0) {
       for (const [, o] of this.snakes) {
         if (o.id === s.id || !o.alive) continue;
@@ -551,7 +545,7 @@ export class GameRoom {
         dv.setUint16(off, snake.id, true); off += 2;
         u8[off++] = snake.skin; u8[off++] = snake.boosting ? 1 : 0; u8[off++] = snake.isBot ? 1 : 0;
         dv.setInt8(off, snake.teamId); off += 1;
-        // 这里的二进制协议里有 invincible 属性下发，前端会自动接收到无敌状态渲染对应的特效
+        // 把无敌状态通过二进制传给前端（前端会利用该参数去画无敌发光或变色皮肤特效）
         u8[off++] = snake.invincible > 0 ? 1 : 0;
         u8[off++] = snake.accessory || 0;
         dv.setUint16(off, Math.min(snake.score, 65535), true); off += 2;
