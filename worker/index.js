@@ -98,6 +98,13 @@ const BROADCAST_MS = 33;
 const MAX_PLAYERS = 30;
 const SKINS_COUNT = 43;
 
+// =====================================================
+// 顶部新增配置项（请确保放在 GameRoom 类定义的上方）
+// =====================================================
+const POWERUP_COUNT = 25;        // 地图上维持的道具（护盾/磁铁）总数
+const POWERUP_DURATION = 12;     // 每吃一个道具增加的持续时间（秒）
+const MAGNET_RANGE = 260;        // 磁铁吸取范围（约5.5格）
+
 const BOT_NAMES = [
   'Viper','Shadow','Blaze','Neon','Ghost','Toxic','Pixel','Glitch',
   'Storm','Bolt','Ember','Frost','Nova','Pulse','Drift','Surge',
@@ -111,6 +118,7 @@ export class GameRoom {
     this.snakes = new Map();
     this.food = [];
     this.megaOrbs = [];
+    this.powerups = []; // 新增：存放地图上的护盾和磁铁道具
     this.bots = [];
     this.nextId = 1;
     this.clients = new Map(); // ws → snakeId
@@ -130,8 +138,8 @@ export class GameRoom {
     this.initialized = true;
     this._spawnFood();
     this._spawnMegaOrbs();
+    this._spawnPowerups(); // 新增：初始刷出道具
     this._spawnBots(MAX_BOTS);
-    // Start game loop via alarm (Durable Objects don't have setInterval)
     this.state.storage.setAlarm(Date.now() + TICK_MS);
   }
 
@@ -139,7 +147,6 @@ export class GameRoom {
     this._tick();
     this._broadcastState();
     this._broadcastLeaderboard();
-    // Schedule next tick
     if (this.clients.size > 0 || this.bots.length > 0) {
       this.state.storage.setAlarm(Date.now() + TICK_MS);
     }
@@ -172,7 +179,6 @@ export class GameRoom {
       }), { headers: { 'Content-Type': 'application/json' } });
     }
 
-    // WebSocket
     if (request.headers.get('Upgrade') === 'websocket') {
       this._init();
       const pair = new WebSocketPair();
@@ -191,7 +197,6 @@ export class GameRoom {
     const type = buf[0];
 
     if (type === 0x03) {
-      // Join: [0x03][skinIdx][accessory][teamId?][name...]
       const skinIdx = buf.length > 1 ? buf[1] : 0;
       const accessory = buf.length > 2 ? buf[2] : 0;
       let teamId = -1, nameStart = 3;
@@ -212,7 +217,6 @@ export class GameRoom {
     } else if (type === 0x02 && buf.length >= 2) {
       snake.boosting = buf[1] === 1;
     } else if (type === 0x07 && buf.length >= 2) {
-      // Emote relay
       const emoteId = buf[1];
       const out = new Uint8Array(4);
       out[0] = 0x07;
@@ -253,7 +257,7 @@ export class GameRoom {
 
   get targetBotCount() { return Math.max(0, MAX_BOTS - this.clients.size); }
 
-  // --- Food ---
+  // --- Food & Powerups ---
   _spawnFood() { while (this.food.length < FOOD_COUNT) this.food.push(this._createFood()); }
   _createFood() {
     const r = Math.random(); let radius, value, tier;
@@ -276,6 +280,20 @@ export class GameRoom {
     return { x: pos.x, y: pos.y, vx: Math.cos(a) * speed, vy: Math.sin(a) * speed, radius: 22 + Math.random() * 8, value: 50 + Math.floor(Math.random() * 31), color: Math.floor(Math.random() * 8), spin: Math.random() * Math.PI * 2 };
   }
 
+  // 新增：生成全图功能道具（护盾/磁铁）
+  _spawnPowerups() { while (this.powerups.length < POWERUP_COUNT) this.powerups.push(this._createPowerup()); }
+  _createPowerup() {
+    const pos = this._zoned(1.4);
+    const type = Math.random() < 0.5 ? 'shield' : 'magnet';
+    return {
+      x: pos.x,
+      y: pos.y,
+      type: type,
+      radius: 18,
+      color: type === 'shield' ? 8 : 9 // 8号颜色代指护盾，9号代指磁铁，供前端区分
+    };
+  }
+
   // --- Bots ---
   _spawnBots(count) {
     for (let i = 0; i < count; i++) {
@@ -291,7 +309,17 @@ export class GameRoom {
     const pos = isBot ? this._zoned(1.2) : this._zoned(2.5);
     const segments = [];
     for (let i = 0; i < INITIAL_LENGTH; i++) segments.push({ x: pos.x - Math.cos(angle) * i * SEGMENT_SPACING, y: pos.y - Math.sin(angle) * i * SEGMENT_SPACING });
-    const snake = { id, name, segments, angle, targetAngle: angle, boosting: false, score: 0, skin: skinIdx, accessory: accessory || 0, color: Math.floor(Math.random() * 8), alive: true, isBot, skill: skill || 0, boostAccum: 0, botTimer: 0, botWanderAngle: angle, teamId: -1, invincible: 2, kills: 0 };
+    
+    // 基础蛇属性：原本的无敌(invincible)直接承载护盾倒计时，新增 magnetTime 磁铁倒计时
+    const snake = { 
+      id, name, segments, angle, targetAngle: angle, 
+      boosting: false, score: 0, skin: skinIdx, accessory: accessory || 0, 
+      color: Math.floor(Math.random() * 8), alive: true, isBot, skill: skill || 0, 
+      boostAccum: 0, botTimer: 0, botWanderAngle: angle, teamId: -1, 
+      invincible: 2.5, // 刚出生默认给予 2.5 秒无敌保护
+      magnetTime: 0,   // 新增：磁铁道具时长控制（秒）
+      kills: 0 
+    };
     this.snakes.set(id, snake);
     return snake;
   }
@@ -302,7 +330,6 @@ export class GameRoom {
     const snake = this._createSnake(name, false, skinIdx, 0, accessory);
     if (this.mode === 'team' && this.teams.has(teamId)) { snake.teamId = teamId; this.teams.get(teamId).memberIds.add(snake.id); }
     this.clients.set(ws, snake.id);
-    // Welcome: [0x02][version u8][id u16]
     const welcome = new Uint8Array(4);
     welcome[0] = 0x02; welcome[1] = 1;
     new DataView(welcome.buffer).setUint16(2, snake.id, true);
@@ -327,6 +354,19 @@ export class GameRoom {
   _killSnake(id, killerId, noRespawn = false) {
     const snake = this.snakes.get(id);
     if (!snake || !snake.alive) return;
+    
+    // 无敌/护盾判定：如果死因是碰到边界或被撞，但此时无敌时长 > 0，则网开一面不予清除
+    if (snake.invincible > 0) {
+      // 如果是在边界被拦截，将其弹回地图中央方向，防止在边界摩擦卡死
+      const h = MAP_SIZE / 2 - 200;
+      const head = snake.segments[0];
+      if (Math.abs(head.x) > h || Math.abs(head.y) > h) {
+        snake.targetAngle = Math.atan2(-head.y, -head.x);
+        snake.angle = snake.targetAngle;
+      }
+      return; 
+    }
+
     snake.alive = false;
     const dropStep = Math.max(3, Math.floor(snake.segments.length / 10));
     let count = 0;
@@ -352,19 +392,21 @@ export class GameRoom {
     this.snakes.delete(id);
   }
 
-  // --- Tick ---
+  // --- Tick主循环 ---
   _tick() {
     const now = Date.now();
     const dt = Math.min((now - this.lastTick) / 1000, 0.05);
     this.lastTick = now;
     this.tickCount++;
-    // Mega orbs
+
+    // 移动超级能量球
     const half = MAP_SIZE / 2 - 50;
     for (const m of this.megaOrbs) { m.x += m.vx * dt; m.y += m.vy * dt; m.spin += dt * 1.5; if (m.x < -half) { m.x = -half; m.vx = Math.abs(m.vx); } if (m.x > half) { m.x = half; m.vx = -Math.abs(m.vx); } if (m.y < -half) { m.y = -half; m.vy = Math.abs(m.vy); } if (m.y > half) { m.y = half; m.vy = -Math.abs(m.vy); } }
-    // Bot AI
+    
+    // Bot 决策
     for (const [, s] of this.snakes) { if (s.isBot && s.alive) this._botAI(s, dt); }
-    // Update snakes
-    // Build food grid
+    
+    // 构建食物空间网格
     const foodGrid = new Map();
     for (let i = 0; i < this.food.length; i++) {
       const f = this.food[i];
@@ -372,23 +414,42 @@ export class GameRoom {
       if (!foodGrid.has(key)) foodGrid.set(key, []);
       foodGrid.get(key).push(i);
     }
+
+    // 更新所有的蛇（包括消耗道具时间、执行磁铁吸取逻辑）
     for (const [, s] of this.snakes) { if (s.alive) this._updateSnake(s, dt, foodGrid); }
+    
+    // 碰撞检测
     this._checkCollisions();
-    this._spawnFood(); this._spawnMegaOrbs();
+
+    // 实时动态补充各种物件
+    this._spawnFood(); 
+    this._spawnMegaOrbs();
+    this._spawnPowerups(); // 保持地图道具充足
+
     while (this.food.length > MAX_FOOD) this.food.shift();
   }
 
   _updateSnake(snake, dt, foodGrid) {
+    // 扣减状态时长（倒计时逻辑）
     if (snake.invincible > 0) snake.invincible = Math.max(0, snake.invincible - dt);
+    if (snake.magnetTime > 0) snake.magnetTime = Math.max(0, snake.magnetTime - dt);
+
     let ad = snake.targetAngle - snake.angle;
     while (ad > Math.PI) ad -= Math.PI * 2; while (ad < -Math.PI) ad += Math.PI * 2;
     if (Math.abs(ad) < 9 * dt) snake.angle = snake.targetAngle; else snake.angle += Math.sign(ad) * 9 * dt;
     if (snake.boosting && snake.score <= 0) snake.boosting = false;
+    
     const speed = snake.boosting ? BOOST_SPEED : SNAKE_SPEED;
     const head = snake.segments[0];
     head.x += Math.cos(snake.angle) * speed * dt; head.y += Math.sin(snake.angle) * speed * dt;
+    
+    // 边界检查
     const h = MAP_SIZE / 2;
-    if (head.x < -h || head.x > h || head.y < -h || head.y > h) { this._killSnake(snake.id, null); return; }
+    if (head.x < -h || head.x > h || head.y < -h || head.y > h) { 
+      this._killSnake(snake.id, null); 
+      if (!snake.alive) return; 
+    }
+    
     while (snake.segments.length >= 2) {
       const dx = head.x - snake.segments[1].x, dy = head.y - snake.segments[1].y;
       if (dx * dx + dy * dy < SEGMENT_SPACING ** 2) break;
@@ -397,16 +458,25 @@ export class GameRoom {
     }
     const tl = INITIAL_LENGTH + Math.floor(8 * Math.log(1 + snake.score / 10));
     while (snake.segments.length > tl) snake.segments.pop();
+    
     if (snake.boosting && snake.score > 0) {
       snake.boostAccum += BOOST_SHRINK_RATE * dt;
       if (snake.boostAccum >= 1) { const rm = Math.floor(snake.boostAccum); snake.boostAccum -= rm; snake.score = Math.max(0, snake.score - rm); if (snake.segments.length > 0) { const tail = snake.segments[snake.segments.length - 1]; this.food.push({ x: tail.x + (Math.random() - 0.5) * 14, y: tail.y + (Math.random() - 0.5) * 14, color: snake.color, radius: 5 + Math.random() * 2, value: 1, tier: 0 }); } }
     }
-    // Eat food using spatial grid
-    const headR = HEAD_RADIUS * this._thickness(snake), eatR = headR + 30;
+
+    // ====== 道具核心逻辑 1：磁铁动态控制吸取范围 ======
+    const headR = HEAD_RADIUS * this._thickness(snake);
+    const isMagnetActive = snake.magnetTime > 0;
+    const eatR = isMagnetActive ? MAGNET_RANGE : (headR + 30); 
+    const eatRSq = eatR * eatR;
+
     const cx = Math.floor(head.x / 500), cy = Math.floor(head.y / 500);
     const toRemove = [];
-    for (let gx = cx - 1; gx <= cx + 1; gx++) {
-      for (let gy = cy - 1; gy <= cy + 1; gy++) {
+    const gridSpan = isMagnetActive ? 2 : 1; // 磁铁范围大时扩大扫描单元格
+
+    // 扫描周围网格内的普通食物
+    for (let gx = cx - gridSpan; gx <= cx + gridSpan; gx++) {
+      for (let gy = cy - gridSpan; gy <= cy + gridSpan; gy++) {
         const cell = foodGrid.get(gx + ',' + gy);
         if (!cell) continue;
         for (const fi of cell) {
@@ -414,45 +484,71 @@ export class GameRoom {
           if (!f) continue;
           const dx = f.x - head.x, dy = f.y - head.y;
           if (dx > eatR || dx < -eatR || dy > eatR || dy < -eatR) continue;
-          if (dx * dx + dy * dy < (headR + f.radius) ** 2) { toRemove.push(fi); snake.score += f.value || 1; }
+          
+          // 如果开了磁铁，进入吸取范围即可吃掉；否则必须贴到蛇头
+          if (isMagnetActive || (dx * dx + dy * dy < (headR + f.radius) ** 2)) { 
+            toRemove.push(fi); 
+            snake.score += f.value || 1; 
+          }
         }
       }
     }
     if (toRemove.length > 0) { toRemove.sort((a, b) => b - a); for (const i of toRemove) this.food.splice(i, 1); }
-    // Eat mega orbs
+
+    // 吃大型能量球（同步支持磁铁）
     for (let i = this.megaOrbs.length - 1; i >= 0; i--) {
       const m = this.megaOrbs[i], dx = head.x - m.x, dy = head.y - m.y;
-      if (dx * dx + dy * dy < (headR + m.radius) ** 2) { this.megaOrbs.splice(i, 1); snake.score += m.value; }
+      if (isMagnetActive ? (dx*dx + dy*dy < eatRSq) : (dx * dx + dy * dy < (headR + m.radius) ** 2)) { 
+        this.megaOrbs.splice(i, 1); 
+        snake.score += m.value; 
+      }
+    }
+
+    // ====== 道具核心逻辑 2：捡起地上的道具并累加时长 ======
+    for (let i = this.powerups.length - 1; i >= 0; i--) {
+      const p = this.powerups[i], dx = head.x - p.x, dy = head.y - p.y;
+      if (isMagnetActive ? (dx*dx + dy*dy < eatRSq) : (dx * dx + dy * dy < (headR + p.radius) ** 2)) {
+        if (p.type === 'shield') {
+          // 如果已经是无敌状态则叠加时长，若不是（或无敌快没了），重置为累计时长
+          snake.invincible = Math.max(snake.invincible, 0) + POWERUP_DURATION;
+        } else if (p.type === 'magnet') {
+          snake.magnetTime = snake.magnetTime + POWERUP_DURATION; // 磁铁时长直接无缝累加
+        }
+        this.powerups.splice(i, 1);
+      }
     }
   }
 
   _checkCollisions() {
     const arr = Array.from(this.snakes.values()).filter(s => s.alive);
     for (let i = 0; i < arr.length; i++) {
-      const a = arr[i]; if (!a.alive || a.invincible > 0) continue;
+      const a = arr[i]; if (!a.alive || a.invincible > 0) continue; // 如果a自带防护盾，免检
       const ahead = a.segments[0], aHeadR = HEAD_RADIUS * this._thickness(a) * 0.75;
       for (let j = 0; j < arr.length; j++) {
         if (i === j) continue;
-        const b = arr[j]; if (!b.alive || b.invincible > 0) continue;
+        const b = arr[j]; if (!b.alive); // 对方死亡则跳过
         if (this.mode === 'team' && a.teamId >= 0 && a.teamId === b.teamId) continue;
         const bDotR = DOT_RADIUS * this._thickness(b) * 0.75;
         const dist = aHeadR + bDotR, distSq = dist * dist;
         for (let k = 1; k < b.segments.length; k++) {
           const seg = b.segments[k], dx = ahead.x - seg.x, dy = ahead.y - seg.y;
-          if (dx * dx + dy * dy < distSq) { this._killSnake(a.id, b.id); b.score += Math.floor(a.segments.length / 2 + a.score / 4); break; }
+          if (dx * dx + dy * dy < distSq) { 
+            this._killSnake(a.id, b.id); 
+            if (!a.alive) { b.score += Math.floor(a.segments.length / 2 + a.score / 4); break; }
+          }
         }
         if (!a.alive) break;
       }
     }
   }
 
-  // --- Bot AI (simplified for DO) ---
+  // --- Bot AI ---
   _botAI(s, dt) {
     s.botTimer -= dt; if (s.botTimer > 0) return;
     s.botTimer = s.skill === 2 ? 0.08 : s.skill === 1 ? 0.3 + Math.random() * 0.4 : 0.5 + Math.random() * 0.6;
     const head = s.segments[0], wall = MAP_SIZE / 2 - 250;
     if (Math.abs(head.x) > wall || Math.abs(head.y) > wall) { s.targetAngle = Math.atan2(-head.y, -head.x); s.boosting = s.skill > 0; return; }
-    // Avoid nearby body segments
+    
     for (const [, o] of this.snakes) {
       if (o.id === s.id || !o.alive) continue;
       for (let k = 0; k < Math.min(o.segments.length, 20); k += 2) {
@@ -460,43 +556,70 @@ export class GameRoom {
         if (d < 100) { const aTo = Math.atan2(dy, dx); let diff = aTo - s.angle; while (diff > Math.PI) diff -= Math.PI * 2; while (diff < -Math.PI) diff += Math.PI * 2; if (Math.abs(diff) < Math.PI / 2) { s.targetAngle = s.angle + (diff > 0 ? -1 : 1) * Math.PI / 2; s.boosting = false; return; } }
       }
     }
-    // Seek food
+    
+    // 决策：AI会顺便扫描附近的特殊道具
     const range = s.skill === 2 ? 600 : s.skill === 1 ? 450 : 300;
     let cl = null, cSq = range * range;
-    for (const f of this.food) { const dx = f.x - head.x; if (dx > range || dx < -range) continue; const dy = f.y - head.y; if (dy > range || dy < -range) continue; const d2 = dx * dx + dy * dy; if (d2 < cSq) { cSq = d2; cl = f; } }
+    
+    // 顺路捡捡附近的护盾/磁铁
+    for(const p of this.powerups) {
+      const dx = p.x - head.x, dy = p.y - head.y;
+      if (dx > range || dx < -range || dy > range || dy < -range) continue;
+      const d2 = dx * dx + dy * dy;
+      if(d2 < cSq) { cSq = d2; cl = p; }
+    }
+    
+    if(!cl) {
+      for (const f of this.food) { const dx = f.x - head.x; if (dx > range || dx < -range) continue; const dy = f.y - head.y; if (dy > range || dy < -range) continue; const d2 = dx * dx + dy * dy; if (d2 < cSq) { cSq = d2; cl = f; } }
+    }
+    
     if (cl) { s.targetAngle = Math.atan2(cl.y - head.y, cl.x - head.x); s.boosting = false; }
     else { s.botWanderAngle += (Math.random() - 0.5) * 1.5; s.targetAngle = s.botWanderAngle; s.boosting = false; }
   }
 
-  // --- Broadcasting ---
+  // --- Broadcasting 状态同步 (核心重构：Bitmask下发) ---
   _broadcastState() {
     for (const [ws, playerId] of this.clients) {
       const mySnake = this.snakes.get(playerId);
       if (!mySnake || !mySnake.alive) continue;
       const cx = mySnake.segments[0].x, cy = mySnake.segments[0].y, viewRange = 1800;
-      const visSnakes = [], visFood = [], visMega = [];
+      const visSnakes = [], visFood = [], visMega = [], visPowerups = [];
+      
       for (const [, snake] of this.snakes) {
         if (!snake.alive) continue;
         for (let i = 0; i < snake.segments.length; i += 3) { if (Math.abs(snake.segments[i].x - cx) < viewRange && Math.abs(snake.segments[i].y - cy) < viewRange) { visSnakes.push(snake); break; } }
       }
       for (const f of this.food) { if (Math.abs(f.x - cx) < viewRange && Math.abs(f.y - cy) < viewRange) visFood.push(f); }
       for (const m of this.megaOrbs) { if (Math.abs(m.x - cx) < viewRange && Math.abs(m.y - cy) < viewRange) visMega.push(m); }
+      // 收集视野内对玩家可见的护盾/磁铁道具
+      for (const p of this.powerups) { if (Math.abs(p.x - cx) < viewRange && Math.abs(p.y - cy) < viewRange) visPowerups.push(p); }
 
-      // Binary packet
       let totalSegs = 0, totalNameBytes = 0;
       for (const s of visSnakes) { totalSegs += s.segments.length; totalNameBytes += new TextEncoder().encode(s.name).length; }
-      const bufSize = 1 + 2 + visSnakes.length * (2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 2) + totalNameBytes + totalSegs * 4 + 2 + visFood.length * 7 + 2 + visMega.length * 7;
+      
+      // 保持原有网络结构，尾部追加新增的 visPowerups 数据传输 [2字节数量 + 每个道具7字节(x,y,color,radius)]
+      const bufSize = 1 + 2 + visSnakes.length * (2 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 2) + totalNameBytes + totalSegs * 4 + 2 + visFood.length * 7 + 2 + visMega.length * 7 + 2 + visPowerups.length * 6;
       const buf = new ArrayBuffer(bufSize);
       const u8 = new Uint8Array(buf);
       const dv = new DataView(buf);
       let off = 0;
+      
       u8[off++] = 0x01;
       dv.setUint16(off, visSnakes.length, true); off += 2;
       for (const snake of visSnakes) {
         dv.setUint16(off, snake.id, true); off += 2;
         u8[off++] = snake.skin; u8[off++] = snake.boosting ? 1 : 0; u8[off++] = snake.isBot ? 1 : 0;
         dv.setInt8(off, snake.teamId); off += 1;
-        u8[off++] = snake.invincible > 0 ? 1 : 0;
+        
+        // =====================================================
+        // 核心修改：将单字节的无敌改造成状态按位掩码(Bitmask)
+        // 1=仅有护盾/无敌, 2=仅有磁铁, 3=全都有, 0=无状态。无缝平滑兼容原结构
+        // =====================================================
+        let statusMask = 0;
+        if (snake.invincible > 0) statusMask |= 1;
+        if (snake.magnetTime > 0) statusMask |= 2;
+        u8[off++] = statusMask; 
+        
         u8[off++] = snake.accessory || 0;
         dv.setUint16(off, Math.min(snake.score, 65535), true); off += 2;
         const nameBytes = new TextEncoder().encode(snake.name);
@@ -505,10 +628,24 @@ export class GameRoom {
         dv.setUint16(off, snake.segments.length, true); off += 2;
         for (const seg of snake.segments) { dv.setInt16(off, Math.round(seg.x), true); off += 2; dv.setInt16(off, Math.round(seg.y), true); off += 2; }
       }
+      
+      // 普通食物
       dv.setUint16(off, visFood.length, true); off += 2;
       for (const f of visFood) { dv.setInt16(off, Math.round(f.x), true); off += 2; dv.setInt16(off, Math.round(f.y), true); off += 2; u8[off++] = f.color; u8[off++] = Math.round(f.radius); u8[off++] = f.tier; }
+      
+      // 超级能量球
       dv.setUint16(off, visMega.length, true); off += 2;
       for (const m of visMega) { dv.setInt16(off, Math.round(m.x), true); off += 2; dv.setInt16(off, Math.round(m.y), true); off += 2; u8[off++] = m.color; u8[off++] = Math.round(m.radius); u8[off++] = Math.min(m.value, 255); }
+      
+      // 追加同步：视野内的功能道具（护盾/磁铁个体）
+      dv.setUint16(off, visPowerups.length, true); off += 2;
+      for (const p of visPowerups) { 
+        dv.setInt16(off, Math.round(p.x), true); off += 2; 
+        dv.setInt16(off, Math.round(p.y), true); off += 2; 
+        u8[off++] = p.color; // 8代表护盾球，9代表磁铁球
+        u8[off++] = Math.round(p.radius);
+      }
+      
       try { ws.send(buf); } catch (e) { this.webSocketClose(ws); }
     }
   }
